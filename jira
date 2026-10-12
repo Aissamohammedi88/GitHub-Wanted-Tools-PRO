@@ -1,0 +1,2022 @@
+#!/usr/bin/env python3# -*- coding: utf-8 -*-
+"""
+GITHUB WANTED TOOLS PRO v2.0
+Moteur complet de gestion de discussions GitHub-like
+8 fonctionnalites demandees par les utilisateurs et non creees par GitHub
+
+1. Sous-discussions imbriquees (arbres jusqu'a 20 niveaux)
+2. Detection de doublons (TF-IDF + cosine similarity)
+3. Resume automatique extractif
+4. Vote unique par utilisateur
+5. Recherche wildcards + full-text SQLite FTS5
+6. Reactions multiples typees (upvote, downvote, love, fire...)
+7. Notifications & abonnements
+8. Export JSON/Markdown/CSV
+
+Auteur : Aissa Mohammedi (DGK)
+Version : 2.0.0
+Licence : MIT
+"""
+import os
+import re
+import sys
+import csv
+import math
+import json
+import time
+import uuid
+import sqlite3
+import hashlib
+import socket
+import shutil
+import threading
+import statistics
+import urllib.parse
+import urllib.request
+import urllib.error
+import http.server
+import socketserver
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Dict, List, Any, Tuple, Set
+from collections import Counter, defaultdict
+from io import StringIO
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG GLOBALE
+# ══════════════════════════════════════════════════════════════════════════════
+VERSION = "2.0.0"
+AUTHOR = "Aissa Mohammedi (DGK)"
+LICENCE = "MIT"
+PORT = int(os.environ.get("PORT", 9500))
+HOST = "0.0.0.0"
+
+HOME = Path.home()
+BASE_DIR = HOME / "Documents" / "github_wanted_pro"
+DB_PATH = BASE_DIR / "data.db"
+EXPORT_DIR = BASE_DIR / "exports"
+BACKUP_DIR = BASE_DIR / "backups"
+LOG_DIR = BASE_DIR / "logs"
+
+for d in (BASE_DIR, EXPORT_DIR, BACKUP_DIR, LOG_DIR):
+d.mkdir(parents=True, exist_ok=True)
+
+LOG_FILE = LOG_DIR / "app.log"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COULEURS TERMINAL
+# ══════════════════════════════════════════════════════════════════════════════
+class Colors:
+OK = "\033[92m"
+WARN = "\033[93m"
+ERR = "\033[91m"
+INFO = "\033[94m"
+CYAN = "\033[96m"
+MAGENTA = "\033[95m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+
+def ok(m): print(Colors.OK + "[OK] " + Colors.RESET + m)
+def warn(m): print(Colors.WARN + "[!!] " + Colors.RESET + m)
+def err(m): print(Colors.ERR + "[KO] " + Colors.RESET + m)
+def info(m): print(Colors.INFO + "[i] " + Colors.RESET + m)
+def title(m):
+print()
+print(Colors.CYAN + "=" * 72 + Colors.RESET)
+print(Colors.CYAN + " " + m + Colors.RESET)
+print(Colors.CYAN + "=" * 72 + Colors.RESET)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LOGGER
+# ══════════════════════════════════════════════════════════════════════════════
+class Logger:
+def __init__(self, path):
+self.path = path
+
+def _write(self, level, msg):
+line = "[" + datetime.now().isoformat() + "] [" + level + "] " + str(msg) + "\n"
+try:
+with open(self.path, "a", encoding="utf-8") as f:
+f.write(line)
+except Exception:
+pass
+
+def info(self, m): self._write("INFO", m)
+def warn(self, m): self._write("WARN", m)
+def error(self, m): self._write("ERROR", m)
+def debug(self, m): self._write("DEBUG", m)
+
+
+log = Logger(LOG_FILE)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATABASE
+# ══════════════════════════════════════════════════════════════════════════════
+SCHEMA_VERSION = 2
+
+SCHEMA_SQL = """
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+
+CREATE TABLE IF NOT EXISTS schema_version (
+version INTEGER PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS users (
+id TEXT PRIMARY KEY,
+username TEXT UNIQUE NOT NULL,
+display_name TEXT,
+email TEXT,
+avatar TEXT,
+created_at TEXT NOT NULL,
+karma INTEGER DEFAULT 0,
+bio TEXT
+);
+
+CREATE TABLE IF NOT EXISTS repos (
+id TEXT PRIMARY KEY,
+full_name TEXT UNIQUE NOT NULL,
+description TEXT,
+owner TEXT,
+stars INTEGER DEFAULT 0,
+created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS discussions (
+id TEXT PRIMARY KEY,
+repo TEXT NOT NULL,
+title TEXT NOT NULL,
+body TEXT NOT NULL,
+author TEXT NOT NULL,
+parent_id TEXT,
+root_id TEXT,
+depth INTEGER DEFAULT 0,
+created_at TEXT NOT NULL,
+updated_at TEXT NOT NULL,
+upvotes INTEGER DEFAULT 0,
+downvotes INTEGER DEFAULT 0,
+score INTEGER DEFAULT 0,
+comment_count INTEGER DEFAULT 0,
+view_count INTEGER DEFAULT 0,
+status TEXT DEFAULT 'open',
+locked INTEGER DEFAULT 0,
+pinned INTEGER DEFAULT 0,
+FOREIGN KEY (parent_id) REFERENCES discussions(id)
+);
+
+CREATE TABLE IF NOT EXISTS comments (
+id TEXT PRIMARY KEY,
+discussion_id TEXT NOT NULL,
+parent_id TEXT,
+author TEXT NOT NULL,
+body TEXT NOT NULL,
+created_at TEXT NOT NULL,
+updated_at TEXT NOT NULL,
+upvotes INTEGER DEFAULT 0,
+downvotes INTEGER DEFAULT 0,
+depth INTEGER DEFAULT 0,
+edited INTEGER DEFAULT 0,
+deleted INTEGER DEFAULT 0,
+FOREIGN KEY (discussion_id) REFERENCES discussions(id),
+FOREIGN KEY (parent_id) REFERENCES comments(id)
+);
+
+CREATE TABLE IF NOT EXISTS votes (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+target_type TEXT NOT NULL,
+target_id TEXT NOT NULL,
+user_id TEXT NOT NULL,
+direction INTEGER NOT NULL,
+created_at TEXT NOT NULL,
+UNIQUE(target_type, target_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS reactions (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+target_type TEXT NOT NULL,
+target_id TEXT NOT NULL,
+user_id TEXT NOT NULL,
+emoji TEXT NOT NULL,
+created_at TEXT NOT NULL,
+UNIQUE(target_type, target_id, user_id, emoji)
+);
+
+CREATE TABLE IF NOT EXISTS tags (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+discussion_id TEXT NOT NULL,
+tag TEXT NOT NULL,
+UNIQUE(discussion_id, tag)
+);
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+user_id TEXT NOT NULL,
+target_type TEXT NOT NULL,
+target_id TEXT NOT NULL,
+created_at TEXT NOT NULL,
+UNIQUE(user_id, target_type, target_id)
+);
+
+CREATE TABLE IF NOT EXISTS notifications (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+user_id TEXT NOT NULL,
+type TEXT NOT NULL,
+target_type TEXT,
+target_id TEXT,
+message TEXT NOT NULL,
+read INTEGER DEFAULT 0,
+created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS views (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+discussion_id TEXT NOT NULL,
+user_id TEXT,
+ip_hash TEXT,
+viewed_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_disc_repo ON discussions(repo);
+CREATE INDEX IF NOT EXISTS idx_disc_parent ON discussions(parent_id);
+CREATE INDEX IF NOT EXISTS idx_disc_root ON discussions(root_id);
+CREATE INDEX IF NOT EXISTS idx_disc_author ON discussions(author);
+CREATE INDEX IF NOT EXISTS idx_disc_score ON discussions(score DESC);
+CREATE INDEX IF NOT EXISTS idx_comments_disc ON comments(discussion_id);
+CREATE INDEX IF NOT EXISTS idx_comments_parent ON comments(parent_id);
+CREATE INDEX IF NOT EXISTS idx_votes_target ON votes(target_type, target_id);
+CREATE INDEX IF NOT EXISTS idx_reactions_target ON reactions(target_type, target_id);
+CREATE INDEX IF NOT EXISTS idx_tags_disc ON tags(discussion_id);
+CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
+CREATE INDEX IF NOT EXISTS idx_subs_user ON subscriptions(user_id);
+CREATE INDEX IF NOT EXISTS idx_notifs_user ON notifications(user_id, read);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS discussions_fts USING fts5(
+title, body, tags, content='discussions', content_rowid='rowid'
+);
+"""
+
+
+def db():
+conn = sqlite3.connect(DB_PATH)
+conn.row_factory = sqlite3.Row
+conn.execute("PRAGMA foreign_keys=ON")
+return conn
+
+
+def init_db():
+conn = db()
+conn.executescript(SCHEMA_SQL)
+# Set version
+cur = conn.execute("SELECT version FROM schema_version")
+row = cur.fetchone()
+if not row:
+conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+conn.commit()
+conn.close()
+log.info("DB initialized")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UTILITAIRES
+# ══════════════════════════════════════════════════════════════════════════════
+def uid(prefix="x"):
+return prefix + "_" + uuid.uuid4().hex[:16]
+
+
+def now_iso():
+return datetime.now(timezone.utc).isoformat()
+
+
+def hash_ip(ip):
+return hashlib.sha256(ip.encode()).hexdigest()[:16]
+
+
+def paginate_query(table, limit=50, offset=0):
+return " LIMIT ? OFFSET ? ", (limit, offset)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 1 — USERS
+# ══════════════════════════════════════════════════════════════════════════════
+class UserManager:
+
+def create(self, username, display_name=None, email=None, bio=None):
+conn = db()
+existing = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+if existing:
+conn.close()
+return existing["id"]
+
+uid_ = uid("user")
+conn.execute(
+"INSERT INTO users (id, username, display_name, email, bio, created_at) VALUES (?,?,?,?,?,?)",
+(uid_, username, display_name or username, email, bio, now_iso())
+)
+conn.commit()
+conn.close()
+return uid_
+
+def get(self, user_id):
+conn = db()
+row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+conn.close()
+return dict(row) if row else None
+
+def get_by_username(self, username):
+conn = db()
+row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+conn.close()
+return dict(row) if row else None
+
+def add_karma(self, user_id, delta):
+conn = db()
+conn.execute("UPDATE users SET karma = karma + ? WHERE id=?", (delta, user_id))
+conn.commit()
+conn.close()
+
+def stats(self, user_id):
+conn = db()
+discussions = conn.execute("SELECT COUNT(*) FROM discussions WHERE author=?", (user_id,)).fetchone()[0]
+comments = conn.execute("SELECT COUNT(*) FROM comments WHERE author=?", (user_id,)).fetchone()[0]
+votes_given = conn.execute("SELECT COUNT(*) FROM votes WHERE user_id=?", (user_id,)).fetchone()[0]
+user = conn.execute("SELECT karma FROM users WHERE id=?", (user_id,)).fetchone()
+conn.close()
+return {
+"user_id": user_id,
+"discussions": discussions,
+"comments": comments,
+"votes_given": votes_given,
+"karma": user["karma"] if user else 0,
+}
+
+def top(self, limit=10):
+conn = db()
+rows = conn.execute(
+"SELECT * FROM users ORDER BY karma DESC LIMIT ?", (limit,)
+).fetchall()
+conn.close()
+return [dict(r) for r in rows]
+
+
+USERS = UserManager()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 2 — THREADS (sous-discussions imbriquees)
+# ══════════════════════════════════════════════════════════════════════════════
+class ThreadManager:
+
+MAX_DEPTH = 20
+
+def create(self, repo, title, body, author, parent_id=None, tags=None):
+conn = db()
+
+# Determine root and depth
+root_id = None
+depth = 0
+if parent_id:
+parent = conn.execute(
+"SELECT root_id, depth FROM discussions WHERE id=?", (parent_id,)
+).fetchone()
+if parent:
+root_id = parent["root_id"] or parent_id
+depth = parent["depth"] + 1
+if depth > self.MAX_DEPTH:
+conn.close()
+return {"error": "max_depth_exceeded"}
+
+did = uid("disc")
+conn.execute(
+"""INSERT INTO discussions
+(id, repo, title, body, author, parent_id, root_id, depth, created_at, updated_at)
+VALUES (?,?,?,?,?,?,?,?,?,?)""",
+(did, repo, title, body, author, parent_id, root_id, depth, now_iso(), now_iso())
+)
+
+if tags:
+for t in tags:
+if t.strip():
+conn.execute(
+"INSERT OR IGNORE INTO tags (discussion_id, tag) VALUES (?,?)",
+(did, t.strip().lower())
+)
+
+# Update parent comment_count
+if parent_id:
+conn.execute(
+"UPDATE discussions SET comment_count = comment_count + 1, updated_at=? WHERE id=?",
+(now_iso(), parent_id)
+)
+
+# FTS index
+try:
+conn.execute(
+"INSERT INTO discussions_fts (rowid, title, body, tags) VALUES ((SELECT rowid FROM discussions WHERE id=?), ?, ?, ?)",
+(did, title, body, ",".join(tags) if tags else "")
+)
+except Exception:
+pass
+
+conn.commit()
+conn.close()
+
+# Notify subscribers of parent
+if parent_id:
+self._notify_subscribers(parent_id, "reply", did, "Nouvelle reponse : " + title[:60])
+
+return {"id": did, "root_id": root_id or did, "depth": depth}
+
+def get(self, discussion_id):
+conn = db()
+row = conn.execute("SELECT * FROM discussions WHERE id=?", (discussion_id,)).fetchone()
+if not row:
+conn.close()
+return None
+d = dict(row)
+d["tags"] = [t["tag"] for t in conn.execute(
+"SELECT tag FROM tags WHERE discussion_id=?", (discussion_id,)
+).fetchall()]
+conn.close()
+return d
+
+def get_tree(self, discussion_id, max_depth=None):
+"""Recupere un arbre complet recursivement"""
+max_depth = max_depth or self.MAX_DEPTH
+conn = db()
+
+def build(did, current_depth=0):
+if current_depth > max_depth:
+return None
+row = conn.execute("SELECT * FROM discussions WHERE id=?", (did,)).fetchone()
+if not row:
+return None
+d = dict(row)
+d["depth_in_tree"] = current_depth
+d["tags"] = [t["tag"] for t in conn.execute(
+"SELECT tag FROM tags WHERE discussion_id=?", (did,)
+).fetchall()]
+d["comments"] = self._comments_tree(conn, did)
+children = conn.execute(
+"SELECT id FROM discussions WHERE parent_id=? ORDER BY score DESC, created_at DESC",
+(did,)
+).fetchall()
+d["children"] = []
+for c in children:
+child = build(c["id"], current_depth + 1)
+if child:
+d["children"].append(child)
+return d
+
+tree = build(discussion_id)
+conn.close()
+return tree
+
+def _comments_tree(self, conn, discussion_id):
+rows = conn.execute(
+"SELECT * FROM comments WHERE discussion_id=? AND deleted=0 ORDER BY created_at ASC",
+(discussion_id,)
+).fetchall()
+
+comments = [dict(r) for r in rows]
+by_parent = defaultdict(list)
+for c in comments:
+by_parent[c["parent_id"]].append(c)
+
+def build(parent_id, depth=0):
+result = []
+for c in by_parent.get(parent_id, []):
+c["depth_in_tree"] = depth
+c["children"] = build(c["id"], depth + 1)
+result.append(c)
+return result
+
+return build(None)
+
+def add_comment(self, discussion_id, body, author, parent_id=None):
+conn = db()
+
+depth = 0
+if parent_id:
+parent = conn.execute("SELECT depth FROM comments WHERE id=?", (parent_id,)).fetchone()
+if parent:
+depth = parent["depth"] + 1
+
+cid = uid("cmt")
+conn.execute(
+"""INSERT INTO comments
+(id, discussion_id, parent_id, author, body, created_at, updated_at, depth)
+VALUES (?,?,?,?,?,?,?,?)""",
+(cid, discussion_id, parent_id, author, body, now_iso(), now_iso(), depth)
+)
+conn.execute(
+"UPDATE discussions SET comment_count = comment_count + 1, updated_at=? WHERE id=?",
+(now_iso(), discussion_id)
+)
+conn.commit()
+conn.close()
+
+self._notify_subscribers(discussion_id, "comment", cid, "Nouveau commentaire")
+return cid
+
+def _notify_subscribers(self, discussion_id, type_, target_id, message):
+conn = db()
+subs = conn.execute(
+"SELECT user_id FROM subscriptions WHERE target_type='discussion' AND target_id=?",
+(discussion_id,)
+).fetchall()
+for s in subs:
+conn.execute(
+"INSERT INTO notifications (user_id, type, target_type, target_id, message, created_at) VALUES (?,?,?,?,?,?)",
+(s["user_id"], type_, "discussion", discussion_id, message, now_iso())
+)
+conn.commit()
+conn.close()
+
+def count_all(self, discussion_id):
+"""Compte le nombre total de sous-discussions"""
+conn = db()
+count = conn.execute(
+"SELECT COUNT(*) FROM discussions WHERE root_id=?", (discussion_id,)
+).fetchone()[0]
+conn.close()
+return count
+
+def list_by_repo(self, repo, sort="score", limit=50, offset=0):
+conn = db()
+order = "score DESC" if sort == "score" else ("created_at DESC" if sort == "new" else "score DESC")
+rows = conn.execute(
+"SELECT * FROM discussions WHERE repo=? AND parent_id IS NULL ORDER BY " + order + " LIMIT ? OFFSET ?",
+(repo, limit, offset)
+).fetchall()
+result = []
+for r in rows:
+d = dict(r)
+d["tags"] = [t["tag"] for t in conn.execute(
+"SELECT tag FROM tags WHERE discussion_id=?", (r["id"],)
+).fetchall()]
+result.append(d)
+conn.close()
+return result
+
+
+THREADS = ThreadManager()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 3 — DUPLICATE DETECTION (TF-IDF + cosine)
+# ══════════════════════════════════════════════════════════════════════════════
+class DuplicateDetector:
+
+STOPWORDS = {
+"le", "la", "les", "un", "une", "des", "de", "du", "et", "ou", "a",
+"au", "aux", "en", "dans", "sur", "pour", "par", "avec", "ce", "cet",
+"cette", "ces", "qui", "que", "quoi", "dont", "ou", "est", "sont",
+"etre", "avoir", "je", "tu", "il", "elle", "nous", "vous", "ils",
+"elles", "je", "me", "te", "se", "mon", "ton", "son", "notre",
+"votre", "leur", "the", "a", "an", "is", "are", "and", "or", "for",
+"with", "in", "to", "of", "on", "at", "by", "it", "this", "that",
+"not", "no", "yes", "be", "been", "have", "has", "had", "do", "does",
+"did", "but", "if", "then", "else", "when", "where", "why", "how",
+}
+
+@staticmethod
+def tokenize(text):
+text = text.lower()
+text = re.sub(r"[^\w\s]", " ", text)
+words = text.split()
+return [w for w in words if len(w) > 2 and w not in DuplicateDetector.STOPWORDS]
+
+@staticmethod
+def vectorize(tokens):
+return Counter(tokens)
+
+@staticmethod
+def cosine(v1, v2):
+keys = set(v1.keys()) | set(v2.keys())
+dot = sum(v1.get(k, 0) * v2.get(k, 0) for k in keys)
+n1 = math.sqrt(sum(v * v for v in v1.values()))
+n2 = math.sqrt(sum(v * v for v in v2.values()))
+if n1 == 0 or n2 == 0:
+return 0.0
+return dot / (n1 * n2)
+
+def compute_tfidf(self, docs):
+"""docs : liste de (id, tokens)"""
+N = len(docs)
+df = Counter()
+for _, tokens in docs:
+for w in set(tokens):
+df[w] += 1
+
+vectors = {}
+for doc_id, tokens in docs:
+tf = Counter(tokens)
+vec = {}
+for w, c in tf.items():
+idf = math.log((N + 1) / (df[w] + 1)) + 1
+vec[w] = c * idf
+vectors[doc_id] = vec
+return vectors
+
+def find_duplicates(self, repo, title, body, threshold=0.5, limit=10):
+"""Cherche les discussions similaires par TF-IDF + cosine"""
+query_text = title + " " + body
+query_tokens = self.tokenize(query_text)
+if not query_tokens:
+return []
+
+conn = db()
+rows = conn.execute(
+"SELECT id, title, body, author, created_at, upvotes, downvotes, score FROM discussions WHERE repo=? AND status='open'",
+(repo,)
+).fetchall()
+conn.close()
+
+if not rows:
+return []
+
+docs = [(query_tokens, query_tokens)]
+for r in rows:
+tokens = self.tokenize(r["title"] + " " + r["body"])
+docs.append((r["id"], tokens))
+
+vectors = self.compute_tfidf(docs)
+query_vec = vectors[query_tokens]
+
+results = []
+for r in rows:
+cand_vec = vectors.get(r["id"], {})
+sim = self.cosine(query_vec, cand_vec)
+if sim >= threshold:
+results.append({
+"id": r["id"],
+"title": r["title"],
+"author": r["author"],
+"created_at": r["created_at"],
+"score": r["score"] or 0,
+"similarity": round(sim * 100, 1),
+"excerpt": r["body"][:300],
+})
+
+results.sort(key=lambda x: x["similarity"], reverse=True)
+return results[:limit]
+
+
+DUPLICATES = DuplicateDetector()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 4 — SUMMARIZER (extractif)
+# ══════════════════════════════════════════════════════════════════════════════
+class Summarizer:
+
+def summarize(self, discussion_id):
+conn = db()
+disc = conn.execute("SELECT * FROM discussions WHERE id=?", (discussion_id,)).fetchone()
+if not disc:
+conn.close()
+return None
+
+texts = [("OP", disc["author"], disc["body"])]
+authors = Counter({disc["author"]: 1})
+
+comments = conn.execute(
+"SELECT author, body FROM comments WHERE discussion_id=? AND deleted=0",
+(discussion_id,)
+).fetchall()
+for c in comments:
+texts.append(("comment", c["author"], c["body"]))
+authors[c["author"]] += 1
+
+children = conn.execute(
+"SELECT id, title, body, author, score FROM discussions WHERE parent_id=?",
+(discussion_id,)
+).fetchall()
+child_summaries = []
+for ch in children:
+texts.append(("sub", ch["author"], ch["body"]))
+authors[ch["author"]] += 1
+child_summaries.append({
+"id": ch["id"],
+"title": ch["title"],
+"author": ch["author"],
+"score": ch["score"] or 0,
+})
+
+conn.close()
+
+# Extraction
+all_text = "\n\n".join(t[2] for t in texts)
+sentences = self._split_sentences(all_text)
+
+if not sentences:
+return {"error": "no_content"}
+
+# TF-IDF scoring
+docs = [(str(i), DuplicateDetector.tokenize(s)) for i, s in enumerate(sentences)]
+vectors = DuplicateDetector.compute_tfidf(docs)
+scored = []
+for i, sent in enumerate(sentences):
+vec = vectors.get(str(i), {})
+score = sum(vec.values()) / max(1, len(vec))
+scored.append((score, i, sent))
+
+scored.sort(reverse=True)
+
+# Top 5 uniques
+top = []
+seen = set()
+for _, _, sent in scored:
+key = sent[:60].lower()
+if key in seen:
+continue
+seen.add(key)
+top.append(sent)
+if len(top) >= 5:
+break
+
+# Themes : top mots
+all_tokens = []
+for s in sentences:
+all_tokens.extend(DuplicateDetector.tokenize(s))
+themes = [w for w, _ in Counter(all_tokens).most_common(10) if len(w) > 4]
+
+return {
+"discussion_id": discussion_id,
+"title": disc["title"],
+"author": disc["author"],
+"created_at": disc["created_at"],
+"score": disc["score"] or 0,
+"total_sentences": len(sentences),
+"total_chars": len(all_text),
+"participants": dict(authors.most_common(10)),
+"participant_count": len(authors),
+"points": top,
+"themes": themes,
+"child_discussions": child_summaries,
+"child_count": len(child_summaries),
+}
+
+def _split_sentences(self, text):
+text = re.sub(r"\n+", " ", text)
+parts = re.split(r"(?<=[.!?])\s+", text)
+return [p.strip() for p in parts if len(p.strip()) > 25]
+
+
+SUMMARIZER = Summarizer()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 5 — VOTES (unique par user)
+# ══════════════════════════════════════════════════════════════════════════════
+class VoteManager:
+
+def vote(self, target_type, target_id, user_id, direction=1):
+if direction not in (-1, 1):
+return {"ok": False, "reason": "invalid_direction"}
+
+conn = db()
+existing = conn.execute(
+"SELECT direction FROM votes WHERE target_type=? AND target_id=? AND user_id=?",
+(target_type, target_id, user_id)
+).fetchone()
+
+if existing:
+# Change vote
+if existing["direction"] == direction:
+conn.close()
+return {"ok": False, "reason": "already_voted", "message": "Tu as deja vote"}
+
+# Update
+conn.execute(
+"UPDATE votes SET direction=? WHERE target_type=? AND target_id=? AND user_id=?",
+(direction, target_type, target_id, user_id)
+)
+delta = direction - existing["direction"]
+else:
+conn.execute(
+"INSERT INTO votes (target_type, target_id, user_id, direction, created_at) VALUES (?,?,?,?,?)",
+(target_type, target_id, user_id, direction, now_iso())
+)
+delta = direction
+
+# Update target
+if target_type == "discussion":
+if direction == 1:
+conn.execute(
+"UPDATE discussions SET upvotes = upvotes + 1, score = score + ? WHERE id=?",
+(delta, target_id)
+)
+else:
+conn.execute(
+"UPDATE discussions SET downvotes = downvotes + 1, score = score + ? WHERE id=?",
+(delta, target_id)
+)
+elif target_type == "comment":
+if direction == 1:
+conn.execute(
+"UPDATE comments SET upvotes = upvotes + 1 WHERE id=?",
+(target_id,)
+)
+else:
+conn.execute(
+"UPDATE comments SET downvotes = downvotes + 1 WHERE id=?",
+(target_id,)
+)
+
+conn.commit()
+conn.close()
+
+# Karma
+author = self._get_author(target_type, target_id)
+if author:
+USERS.add_karma(author, delta * 2)
+
+return {"ok": True, "direction": direction, "delta": delta}
+
+def _get_author(self, target_type, target_id):
+conn = db()
+if target_type == "discussion":
+row = conn.execute("SELECT author FROM discussions WHERE id=?", (target_id,)).fetchone()
+elif target_type == "comment":
+row = conn.execute("SELECT author FROM comments WHERE id=?", (target_id,)).fetchone()
+else:
+row = None
+conn.close()
+return row["author"] if row else None
+
+def unvote(self, target_type, target_id, user_id):
+conn = db()
+existing = conn.execute(
+"SELECT direction FROM votes WHERE target_type=? AND target_id=? AND user_id=?",
+(target_type, target_id, user_id)
+).fetchone()
+
+if not existing:
+conn.close()
+return {"ok": False, "reason": "no_vote"}
+
+direction = existing["direction"]
+conn.execute(
+"DELETE FROM votes WHERE target_type=? AND target_id=? AND user_id=?",
+(target_type, target_id, user_id)
+)
+
+if target_type == "discussion":
+if direction == 1:
+conn.execute(
+"UPDATE discussions SET upvotes = MAX(0, upvotes - 1), score = score - 1 WHERE id=?",
+(target_id,)
+)
+else:
+conn.execute(
+"UPDATE discussions SET downvotes = MAX(0, downvotes - 1), score = score + 1 WHERE id=?",
+(target_id,)
+)
+elif target_type == "comment":
+if direction == 1:
+conn.execute("UPDATE comments SET upvotes = MAX(0, upvotes - 1) WHERE id=?", (target_id,))
+else:
+conn.execute("UPDATE comments SET downvotes = MAX(0, downvotes - 1) WHERE id=?", (target_id,))
+
+conn.commit()
+conn.close()
+return {"ok": True, "direction": direction}
+
+def info(self, target_type, target_id):
+conn = db()
+up = conn.execute(
+"SELECT COUNT(*) FROM votes WHERE target_type=? AND target_id=? AND direction=1",
+(target_type, target_id)
+).fetchone()[0]
+down = conn.execute(
+"SELECT COUNT(*) FROM votes WHERE target_type=? AND target_id=? AND direction=-1",
+(target_type, target_id)
+).fetchone()[0]
+voters = conn.execute(
+"SELECT user_id, direction FROM votes WHERE target_type=? AND target_id=?",
+(target_type, target_id)
+).fetchall()
+conn.close()
+return {
+"upvotes": up,
+"downvotes": down,
+"score": up - down,
+"voters": [{"user_id": v["user_id"], "direction": v["direction"]} for v in voters],
+}
+
+def has_voted(self, target_type, target_id, user_id):
+conn = db()
+row = conn.execute(
+"SELECT direction FROM votes WHERE target_type=? AND target_id=? AND user_id=?",
+(target_type, target_id, user_id)
+).fetchone()
+conn.close()
+return row["direction"] if row else 0
+
+
+VOTES = VoteManager()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 6 — REACTIONS
+# ══════════════════════════════════════════════════════════════════════════════
+class ReactionManager:
+
+ALLOWED = {"upvote": "+1", "downvote": "-1", "love": "heart",
+"fire": "fire", "rocket": "rocket", "eyes": "eyes",
+"laugh": "laugh", "confused": "confused", "hooray": "hooray"}
+
+def add(self, target_type, target_id, user_id, emoji):
+if emoji not in self.ALLOWED:
+return {"ok": False, "reason": "invalid_emoji"}
+
+conn = db()
+try:
+conn.execute(
+"INSERT OR IGNORE INTO reactions (target_type, target_id, user_id, emoji, created_at) VALUES (?,?,?,?,?)",
+(target_type, target_id, user_id, emoji, now_iso())
+)
+conn.commit()
+added = conn.total_changes > 0
+except Exception:
+added = False
+conn.close()
+return {"ok": True, "added": added, "emoji": emoji}
+
+def remove(self, target_type, target_id, user_id, emoji):
+conn = db()
+conn.execute(
+"DELETE FROM reactions WHERE target_type=? AND target_id=? AND user_id=? AND emoji=?",
+(target_type, target_id, user_id, emoji)
+)
+conn.commit()
+conn.close()
+return {"ok": True}
+
+def list(self, target_type, target_id):
+conn = db()
+rows = conn.execute(
+"SELECT emoji, COUNT(*) as cnt FROM reactions WHERE target_type=? AND target_id=? GROUP BY emoji",
+(target_type, target_id)
+).fetchall()
+conn.close()
+return {r["emoji"]: r["cnt"] for r in rows}
+
+
+REACTIONS = ReactionManager()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 7 — SEARCH (wildcard + FTS5)
+# ══════════════════════════════════════════════════════════════════════════════
+class SearchEngine:
+
+@staticmethod
+def wildcard_to_regex(pattern):
+escaped = re.escape(pattern)
+escaped = escaped.replace(r"\*", ".*")
+escaped = escaped.replace(r"\?", ".")
+return re.compile("^" + escaped + "$", re.IGNORECASE)
+
+@staticmethod
+def wildcard_to_like(pattern):
+escaped = pattern.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+return escaped.replace("*", "%").replace("?", "_")
+
+def wildcard_search(self, repo, pattern, search_in="all", limit=50):
+regex = self.wildcard_to_regex(pattern)
+like = self.wildcard_to_like(pattern)
+
+conn = db()
+if repo:
+rows = conn.execute("SELECT * FROM discussions WHERE repo=?", (repo,)).fetchall()
+else:
+rows = conn.execute("SELECT * FROM discussions").fetchall()
+
+results = []
+for r in rows:
+d = dict(r)
+d["tags"] = [t["tag"] for t in conn.execute(
+"SELECT tag FROM tags WHERE discussion_id=?", (r["id"],)
+).fetchall()]
+
+matched = None
+if search_in in ("title", "all") and regex.search(d["title"]):
+matched = "title"
+elif search_in in ("body", "all") and regex.search(d["body"]):
+matched = "body"
+elif search_in in ("author", "all") and regex.search(d["author"]):
+matched = "author"
+elif search_in in ("tags", "all"):
+for t in d["tags"]:
+if regex.search(t):
+matched = "tags"
+break
+
+if matched:
+d["matched_field"] = matched
+results.append(d)
+
+conn.close()
+results.sort(key=lambda x: (x["score"] or 0), reverse=True)
+return results[:limit]
+
+def fulltext_search(self, repo, query, limit=50):
+"""Recherche full-text via SQLite FTS5"""
+conn = db()
+
+# Nettoyer la requete (FTS5 syntax)
+safe_query = re.sub(r"[^\w\s]", " ", query)
+terms = [t for t in safe_query.split() if len(t) > 1]
+
+if not terms:
+conn.close()
+return []
+
+fts_query = " OR ".join(terms)
+
+try:
+rows = conn.execute(
+"""SELECT d.* FROM discussions d
+JOIN discussions_fts fts ON d.rowid = fts.rowid
+WHERE discussions_fts MATCH ?
+ORDER BY rank
+LIMIT ?""",
+(fts_query, limit)
+).fetchall()
+except Exception:
+# Fallback
+rows = conn.execute(
+"SELECT * FROM discussions WHERE title LIKE ? OR body LIKE ? LIMIT ?",
+("%" + query + "%", "%" + query + "%", limit)
+).fetchall()
+
+result = []
+for r in rows:
+d = dict(r)
+if repo and d["repo"] != repo:
+continue
+d["tags"] = [t["tag"] for t in conn.execute(
+"SELECT tag FROM tags WHERE discussion_id=?", (r["id"],)
+).fetchall()]
+result.append(d)
+
+conn.close()
+return result
+
+def search(self, repo, query, mode="auto", limit=50):
+if mode == "auto":
+# Si wildcards presents
+if "*" in query or "?" in query:
+return self.wildcard_search(repo, query, "all", limit)
+return self.fulltext_search(repo, query, limit)
+elif mode == "wildcard":
+return self.wildcard_search(repo, query, "all", limit)
+elif mode == "fulltext":
+return self.fulltext_search(repo, query, limit)
+return []
+
+
+SEARCH = SearchEngine()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 8 — SUBSCRIPTIONS & NOTIFICATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+class SubscriptionManager:
+
+def subscribe(self, user_id, target_type, target_id):
+conn = db()
+try:
+conn.execute(
+"INSERT OR IGNORE INTO subscriptions (user_id, target_type, target_id, created_at) VALUES (?,?,?,?)",
+(user_id, target_type, target_id, now_iso())
+)
+conn.commit()
+ok_ = True
+except Exception:
+ok_ = False
+conn.close()
+return {"ok": ok_}
+
+def unsubscribe(self, user_id, target_type, target_id):
+conn = db()
+conn.execute(
+"DELETE FROM subscriptions WHERE user_id=? AND target_type=? AND target_id=?",
+(user_id, target_type, target_id)
+)
+conn.commit()
+conn.close()
+return {"ok": True}
+
+def list(self, user_id):
+conn = db()
+rows = conn.execute(
+"SELECT * FROM subscriptions WHERE user_id=? ORDER BY created_at DESC",
+(user_id,)
+).fetchall()
+conn.close()
+return [dict(r) for r in rows]
+
+
+SUBSCRIPTIONS = SubscriptionManager()
+
+
+class NotificationManager:
+
+def list(self, user_id, unread_only=False, limit=50):
+conn = db()
+if unread_only:
+rows = conn.execute(
+"SELECT * FROM notifications WHERE user_id=? AND read=0 ORDER BY created_at DESC LIMIT ?",
+(user_id, limit)
+).fetchall()
+else:
+rows = conn.execute(
+"SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+(user_id, limit)
+).fetchall()
+conn.close()
+return [dict(r) for r in rows]
+
+def mark_read(self, notif_id):
+conn = db()
+conn.execute("UPDATE notifications SET read=1 WHERE id=?", (notif_id,))
+conn.commit()
+conn.close()
+return {"ok": True}
+
+def mark_all_read(self, user_id):
+conn = db()
+conn.execute("UPDATE notifications SET read=1 WHERE user_id=?", (user_id,))
+conn.commit()
+conn.close()
+return {"ok": True}
+
+def unread_count(self, user_id):
+conn = db()
+count = conn.execute(
+"SELECT COUNT(*) FROM notifications WHERE user_id=? AND read=0",
+(user_id,)
+).fetchone()[0]
+conn.close()
+return count
+
+def create(self, user_id, type_, message, target_type=None, target_id=None):
+conn = db()
+conn.execute(
+"INSERT INTO notifications (user_id, type, target_type, target_id, message, created_at) VALUES (?,?,?,?,?,?)",
+(user_id, type_, target_type, target_id, message, now_iso())
+)
+conn.commit()
+conn.close()
+
+
+NOTIFICATIONS = NotificationManager()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODULE 9 — EXPORT
+# ══════════════════════════════════════════════════════════════════════════════
+class Exporter:
+
+def export_discussions(self, repo, format_="json"):
+discussions = THREADS.list_by_repo(repo, sort="score", limit=1000)
+
+if format_ == "json":
+path = EXPORT_DIR / ("discussions_" + repo.replace("/", "_") + ".json")
+path.write_text(json.dumps(discussions, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+return str(path)
+
+if format_ == "markdown":
+path = EXPORT_DIR / ("discussions_" + repo.replace("/", "_") + ".md")
+lines = ["# Discussions : " + repo, ""]
+for d in discussions:
+lines.append("## " + d["title"])
+lines.append("")
+lines.append("**Auteur** : " + d["author"])
+lines.append("**Score** : " + str(d["score"] or 0))
+lines.append("**Date** : " + d["created_at"])
+lines.append("")
+lines.append(d["body"])
+lines.append("")
+lines.append("---")
+lines.append("")
+path.write_text("\n".join(lines), encoding="utf-8")
+return str(path)
+
+if format_ == "csv":
+path = EXPORT_DIR / ("discussions_" + repo.replace("/", "_") + ".csv")
+with open(path, "w", newline="", encoding="utf-8") as f:
+writer = csv.writer(f)
+writer.writerow(["id", "title", "author", "score", "upvotes", "downvotes", "created_at", "comment_count"])
+for d in discussions:
+writer.writerow([
+d["id"], d["title"], d["author"], d["score"] or 0,
+d["upvotes"] or 0, d["downvotes"] or 0,
+d["created_at"], d["comment_count"] or 0,
+])
+return str(path)
+
+return None
+
+def backup(self):
+ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+path = BACKUP_DIR / ("data_" + ts + ".db")
+shutil.copy2(DB_PATH, path)
+return str(path)
+
+
+EXPORTER = Exporter()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HTML PAGE
+# ══════════════════════════════════════════════════════════════════════════════
+PAGE = """<!DOCTYPE html>
+<html lang="fr"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GitHub Wanted Tools PRO</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,system-ui,sans-serif;background:#0a0014;color:#fff;padding:20px;min-height:100vh;background-image:radial-gradient(ellipse at top,rgba(200,164,92,0.08),transparent 60%)}
+.c{max-width:1200px;margin:0 auto}
+h1{color:#c8a45c;font-size:26px;margin-bottom:6px;background:linear-gradient(135deg,#fff,#c8a45c);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.s{color:#888;font-size:12px;margin-bottom:20px}
+.tabs{display:flex;gap:6px;margin-bottom:20px;flex-wrap:wrap}
+.tab{background:#14001f;border:1px solid #2a1a3a;color:#888;padding:9px 16px;border-radius:999px;cursor:pointer;font-size:11px;font-weight:600;letter-spacing:1px;transition:all 0.2s}
+.tab:hover{border-color:#c8a45c;color:#c8a45c}
+.tab.active{background:#c8a45c;color:#000;border-color:#c8a45c}
+.panel{display:none}
+.panel.active{display:block}
+.b{background:#14001f;border:1px solid #2a1a3a;border-radius:12px;padding:20px;margin-bottom:14px}
+.b h2{color:#c8a45c;font-size:12px;margin-bottom:12px;text-transform:uppercase;letter-spacing:2px}
+input,textarea,select{width:100%;background:#0a0014;border:1px solid #2a1a3a;color:#4ade80;padding:10px;border-radius:8px;font-family:monospace;font-size:12px;margin-bottom:8px}
+textarea{min-height:80px;resize:vertical}
+input:focus,textarea:focus,select:focus{outline:none;border-color:#c8a45c}
+button{background:linear-gradient(135deg,#c8a45c,#a88838);color:#000;border:none;padding:10px 20px;border-radius:999px;font-weight:700;cursor:pointer;font-size:11px;letter-spacing:1px;margin-right:6px;margin-bottom:6px;transition:all 0.2s}
+button:hover{transform:translateY(-1px);box-shadow:0 4px 16px rgba(200,164,92,0.4)}
+button:disabled{opacity:0.4;cursor:not-allowed;transform:none}
+button.sec{background:transparent;color:#c8a45c;border:1px solid #c8a45c}
+pre{background:#0a0014;padding:12px;border-radius:8px;font-size:11px;color:#4ade80;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word;max-height:500px;margin-top:8px;font-family:monospace;line-height:1.6}
+.thread{background:#0a0014;border-left:3px solid #c8a45c;border-radius:6px;padding:12px;margin-bottom:8px;transition:all 0.2s}
+.thread:hover{background:#0f0018}
+.thread.d1{margin-left:20px;border-left-color:#4ade80}
+.thread.d2{margin-left:40px;border-left-color:#00d4ff}
+.thread.d3{margin-left:60px;border-left-color:#ff6ec7}
+.thread.d4{margin-left:80px;border-left-color:#fbbf24}
+.thread .t{font-weight:700;color:#fff;font-size:13px;margin-bottom:4px}
+.thread .meta{font-size:10px;color:#888;font-family:monospace;margin-bottom:6px}
+.thread .body{font-size:12px;color:#ccc;line-height:1.5;margin-bottom:6px}
+.tag{display:inline-block;background:rgba(200,164,92,0.2);color:#c8a45c;padding:2px 8px;border-radius:10px;font-size:9px;margin-right:4px;font-family:monospace}
+.score{display:inline-block;background:#0f0018;color:#4ade80;padding:2px 8px;border-radius:10px;font-size:10px;font-family:monospace;margin-right:6px}
+.comment{background:#0d0018;border-left:2px solid #2a1a3a;padding:8px 12px;margin:6px 0;border-radius:4px}
+.comment.d1{margin-left:20px}
+.comment.d2{margin-left:40px}
+.comment.d3{margin-left:60px}
+.stat{display:inline-block;background:#0a0014;border:1px solid #2a1a3a;padding:6px 12px;border-radius:8px;font-size:11px;margin-right:6px;margin-bottom:6px;font-family:monospace}
+.stat b{color:#c8a45c}
+.dup{background:#0a0014;border-left:3px solid #fbbf24;padding:10px;border-radius:6px;margin-bottom:8px}
+.dup .sim{color:#fbbf24;font-weight:700;font-family:monospace;font-size:12px}
+.summary-point{background:#0a0014;border-left:3px solid #4ade80;padding:10px;margin-bottom:8px;border-radius:6px;font-size:12px;line-height:1.5}
+.loader{text-align:center;padding:30px;color:#c8a45c}
+.sp{display:inline-block;width:30px;height:30px;border:3px solid rgba(200,164,92,0.2);border-top-color:#c8a45c;border-radius:50%;animation:spin 0.8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:14px}
+.gbox{background:#0a0014;border:1px solid #2a1a3a;border-radius:8px;padding:12px;text-align:center}
+.gbox .n{font-size:20px;font-weight:800;color:#c8a45c;display:block;font-family:monospace}
+.gbox .l{font-size:9px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-top:4px;display:block}
+.actions{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+.mini{padding:4px 10px !important;font-size:10px !important;border-radius:6px !important}
+.hint{color:#666;font-size:11px;font-family:monospace;margin-bottom:8px;line-height:1.5}
+</style></head><body><div class="c">
+<h1>GitHub Wanted Tools PRO</h1>
+<p class="s">8 fonctionnalites demandees - Moteur complet</p>
+
+<div class="tabs">
+<div class="tab active" onclick="switchTab(0,this)">Threads</div>
+<div class="tab" onclick="switchTab(1,this)">Doublons</div>
+<div class="tab" onclick="switchTab(2,this)">Resume</div>
+<div class="tab" onclick="switchTab(3,this)">Votes</div>
+<div class="tab" onclick="switchTab(4,this)">Search</div>
+<div class="tab" onclick="switchTab(5,this)">Stats</div>
+<div class="tab" onclick="switchTab(6,this)">Users</div>
+<div class="tab" onclick="switchTab(7,this)">Export</div>
+</div>
+
+<div class="panel active" id="panel-0">
+<div class="b"><h2>Creer une discussion</h2>
+<input id="t-repo" placeholder="owner/repo" value="Aissamohammedi88/nexus">
+<input id="t-title" placeholder="Titre">
+<textarea id="t-body" placeholder="Corps"></textarea>
+<input id="t-author" placeholder="Ton username" value="alice">
+<input id="t-parent" placeholder="ID parent (optionnel)">
+<input id="t-tags" placeholder="Tags separes par virgule">
+<button onclick="createDisc()">CREER</button>
+</div>
+<div class="b"><h2>Voir un fil</h2>
+<input id="t-view" placeholder="ID de la discussion">
+<button onclick="viewThread()">AFFICHER</button>
+<button class="sec" onclick="listDiscs()">LISTER</button>
+<div id="t-out"></div>
+</div>
+</div>
+
+<div class="panel" id="panel-1">
+<div class="b"><h2>Detection de doublons (TF-IDF)</h2>
+<input id="d-repo" placeholder="owner/repo" value="Aissamohammedi88/nexus">
+<input id="d-title" placeholder="Titre propose">
+<textarea id="d-body" placeholder="Corps propose"></textarea>
+<button onclick="checkDup()">CHERCHER</button>
+<div id="d-out"></div>
+</div>
+</div>
+
+<div class="panel" id="panel-2">
+<div class="b"><h2>Resume extractif</h2>
+<input id="s-id" placeholder="ID discussion">
+<button onclick="summarize()">RESUMER</button>
+<div id="s-out"></div>
+</div>
+</div>
+
+<div class="panel" id="panel-3">
+<div class="b"><h2>Vote unique par utilisateur</h2>
+<input id="v-id" placeholder="ID discussion">
+<input id="v-user" placeholder="User ID" value="user_1">
+<button onclick="vote(1)">UPVOTE</button>
+<button class="sec" onclick="vote(-1)">DOWNVOTE</button>
+<button class="sec" onclick="unvote()">RETIRER</button>
+<button class="sec" onclick="voteInfo()">INFO</button>
+<div id="v-out"></div>
+</div>
+<div class="b"><h2>Reactions emoji</h2>
+<input id="r-id" placeholder="ID discussion">
+<input id="r-user" placeholder="User ID" value="user_1">
+<select id="r-emoji">
+<option value="upvote">+1</option>
+<option value="love">Heart</option>
+<option value="fire">Fire</option>
+<option value="rocket">Rocket</option>
+<option value="eyes">Eyes</option>
+<option value="laugh">Laugh</option>
+<option value="hooray">Hooray</option>
+<option value="confused">Confused</option>
+</select>
+<button onclick="addReaction()">AJOUTER</button>
+<div id="r-out"></div>
+</div>
+</div>
+
+<div class="panel" id="panel-4">
+<div class="b"><h2>Recherche</h2>
+<p class="hint">Wildcards : * et ? - Ou full-text classique</p>
+<input id="w-repo" placeholder="owner/repo (vide = tous)">
+<input id="w-pattern" placeholder="Motif (*fix*, ?bug?, routing)">
+<select id="w-mode">
+<option value="auto">Auto</option>
+<option value="wildcard">Wildcard (* ?)</option>
+<option value="fulltext">Full-text</option>
+</select>
+<button onclick="search()">RECHERCHER</button>
+<div id="w-out"></div>
+</div>
+</div>
+
+<div class="panel" id="panel-5">
+<div class="b"><h2>Statistiques globales</h2>
+<button onclick="loadStats()">RAFRAICHIR</button>
+<div id="st-out"></div>
+</div>
+</div>
+
+<div class="panel" id="panel-6">
+<div class="b"><h2>Utilisateurs</h2>
+<button onclick="loadTopUsers()">TOP USERS</button>
+<div id="u-out"></div>
+</div>
+</div>
+
+<div class="panel" id="panel-7">
+<div class="b"><h2>Export</h2>
+<input id="e-repo" placeholder="owner/repo" value="Aissamohammedi88/nexus">
+<button onclick="exportData('json')">JSON</button>
+<button onclick="exportData('markdown')">Markdown</button>
+<button onclick="exportData('csv')">CSV</button>
+<button class="sec" onclick="backup()">BACKUP DB</button>
+<div id="e-out"></div>
+</div>
+</div>
+
+</div>
+<script>
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+
+function switchTab(i,el){
+document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+el.classList.add('active');
+document.getElementById('panel-'+i).classList.add('active');
+}
+
+async function post(url,data){
+var r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+return await r.json();
+}
+async function get(url){
+var r = await fetch(url);
+return await r.json();
+}
+
+async function createDisc(){
+var d = await post('/api/discussion',{
+repo:document.getElementById('t-repo').value,
+title:document.getElementById('t-title').value,
+body:document.getElementById('t-body').value,
+author:document.getElementById('t-author').value,
+parent_id:document.getElementById('t-parent').value||null,
+tags:document.getElementById('t-tags').value.split(',').map(t=>t.trim()).filter(t=>t)
+});
+alert('ID: '+d.id);
+}
+
+async function viewThread(){
+var id=document.getElementById('t-view').value;
+if(!id){alert('ID requis');return;}
+var d=await get('/api/discussion/'+id);
+document.getElementById('t-out').innerHTML=renderThread(d);
+}
+
+function renderThread(d,depth){
+if(!d)return '<p>Introuvable</p>';
+depth=depth||0;
+var h='<div class="thread d'+Math.min(depth,4)+'">';
+h+='<div class="t">'+esc(d.title)+'</div>';
+h+='<div class="meta">'+esc(d.author)+' - '+esc(d.created_at)+' <span class="score">'+((d.upvotes||0)-(d.downvotes||0))+'</span></div>';
+h+='<div class="body">'+esc(d.body)+'</div>';
+if(d.tags&&d.tags.length){d.tags.forEach(t=>h+='<span class="tag">'+esc(t)+'</span>');}
+if(d.comments&&d.comments.length){
+h+='<div style="margin-top:10px"><b style="color:#4ade80;font-size:11px">COMMENTAIRES</b></div>';
+h+=renderComments(d.comments);
+}
+if(d.children&&d.children.length){
+h+='<div style="margin-top:10px"><b style="color:#00d4ff;font-size:11px">SOUS-DISCUSSIONS ('+d.children.length+')</b></div>';
+d.children.forEach(c=>h+=renderThread(c,depth+1));
+}
+h+='</div>';
+return h;
+}
+
+function renderComments(cs){
+var h='';
+cs.forEach(function(c){
+h+='<div class="comment d'+Math.min(c.depth_in_tree||0,3)+'">';
+h+='<div class="meta">'+esc(c.author)+' - '+esc(c.created_at)+'</div>';
+h+='<div>'+esc(c.body)+'</div>';
+h+='</div>';
+if(c.children&&c.children.length){h+=renderComments(c.children);}
+});
+return h;
+}
+
+async function listDiscs(){
+var repo=document.getElementById('t-repo').value;
+var d=await get('/api/discussions?repo='+encodeURIComponent(repo));
+var h='';
+d.discussions.forEach(function(x){
+h+='<div class="thread">';
+h+='<div class="t">'+esc(x.title)+'</div>';
+h+='<div class="meta">'+esc(x.author)+' - score '+((x.upvotes||0)-(x.downvotes||0))+' - '+esc(x.created_at)+'</div>';
+h+='<div style="font-family:monospace;font-size:10px;color:#666">'+esc(x.id)+'</div>';
+h+='</div>';
+});
+document.getElementById('t-out').innerHTML=h;
+}
+
+async function checkDup(){
+var d=await post('/api/check-duplicate',{
+repo:document.getElementById('d-repo').value,
+title:document.getElementById('d-title').value,
+body:document.getElementById('d-body').value
+});
+var h='';
+if(d.duplicates&&d.duplicates.length){
+h+='<p style="color:#fbbf24;margin-bottom:10px">'+d.duplicates.length+' doublon(s) :</p>';
+d.duplicates.forEach(function(x){
+h+='<div class="dup">';
+h+='<div class="sim">Similarite : '+x.similarity+'%</div>';
+h+='<div style="font-weight:700;margin:4px 0">'+esc(x.title)+'</div>';
+h+='<div style="font-size:11px;color:#888">par '+esc(x.author)+' - score '+x.score+'</div>';
+h+='<div style="font-size:11px;color:#ccc;margin-top:6px">'+esc(x.excerpt)+'</div>';
+h+='</div>';
+});
+} else {h='<p style="color:#4ade80">Aucun doublon detecte.</p>';}
+document.getElementById('d-out').innerHTML=h;
+}
+
+async function summarize(){
+var id=document.getElementById('s-id').value;
+if(!id){alert('ID requis');return;}
+var d=await get('/api/summarize/'+id);
+var h='';
+if(d.error){h='<p style="color:#f87171">'+esc(d.error)+'</p>';}
+else{
+h+='<div class="grid">';
+h+='<div class="gbox"><span class="n">'+d.participant_count+'</span><span class="l">Participants</span></div>';
+h+='<div class="gbox"><span class="n">'+d.total_sentences+'</span><span class="l">Phrases</span></div>';
+h+='<div class="gbox"><span class="n">'+d.child_count+'</span><span class="l">Sous-disc.</span></div>';
+h+='<div class="gbox"><span class="n">'+d.score+'</span><span class="l">Score</span></div>';
+h+='</div>';
+h+='<b style="color:#c8a45c;font-size:11px">POINTS CLES</b>';
+d.points.forEach(function(p){h+='<div class="summary-point">'+esc(p)+'</div>';});
+h+='<b style="color:#c8a45c;font-size:11px;display:block;margin-top:12px">THEMES</b>';
+h+='<div style="margin-top:6px">';
+d.themes.forEach(function(t){h+='<span class="tag">'+esc(t)+'</span>';});
+h+='</div>';
+}
+document.getElementById('s-out').innerHTML=h;
+}
+
+async function vote(dir){
+var d=await post('/api/vote',{
+target_type:'discussion',
+target_id:document.getElementById('v-id').value,
+user_id:document.getElementById('v-user').value,
+direction:dir
+});
+document.getElementById('v-out').innerHTML='<pre>'+JSON.stringify(d,null,2)+'</pre>';
+}
+
+async function unvote(){
+var d=await post('/api/unvote',{
+target_type:'discussion',
+target_id:document.getElementById('v-id').value,
+user_id:document.getElementById('v-user').value
+});
+document.getElementById('v-out').innerHTML='<pre>'+JSON.stringify(d,null,2)+'</pre>';
+}
+
+async function voteInfo(){
+var id=document.getElementById('v-id').value;
+var d=await get('/api/votes/discussion/'+id);
+document.getElementById('v-out').innerHTML='<pre>'+JSON.stringify(d,null,2)+'</pre>';
+}
+
+async function addReaction(){
+var d=await post('/api/reaction',{
+target_type:'discussion',
+target_id:document.getElementById('r-id').value,
+user_id:document.getElementById('r-user').value,
+emoji:document.getElementById('r-emoji').value
+});
+document.getElementById('r-out').innerHTML='<pre>'+JSON.stringify(d,null,2)+'</pre>';
+}
+
+async function search(){
+var d=await post('/api/search',{
+repo:document.getElementById('w-repo').value,
+query:document.getElementById('w-pattern').value,
+mode:document.getElementById('w-mode').value
+});
+var h='';
+if(d.error){h='<p style="color:#f87171">'+esc(d.error)+'</p>';}
+else{
+h+='<p style="color:#4ade80">'+d.count+' resultat(s)</p>';
+d.results.forEach(function(r){
+h+='<div class="thread">';
+h+='<div class="t">'+esc(r.title)+'</div>';
+h+='<div class="meta">'+esc(r.author)+' - score '+(r.score||0)+' - match: '+esc(r.matched_field||'fulltext')+'</div>';
+h+='<div class="body">'+esc(r.body).substring(0,200)+'</div>';
+h+='</div>';
+});
+}
+document.getElementById('w-out').innerHTML=h;
+}
+
+async function loadStats(){
+var d=await get('/api/stats');
+var h='<div class="grid">';
+Object.keys(d).forEach(function(k){
+h+='<div class="gbox"><span class="n">'+d[k]+'</span><span class="l">'+esc(k)+'</span></div>';
+});
+h+='</div>';
+document.getElementById('st-out').innerHTML=h;
+}
+
+async function loadTopUsers(){
+var d=await get('/api/users/top');
+var h='';
+d.users.forEach(function(u){
+h+='<div class="thread">';
+h+='<div class="t">'+esc(u.username)+' ('+esc(u.display_name)+')</div>';
+h+='<div class="meta">karma '+u.karma+' - '+esc(u.created_at)+'</div>';
+h+='</div>';
+});
+document.getElementById('u-out').innerHTML=h;
+}
+
+async function exportData(format){
+var d=await post('/api/export',{
+repo:document.getElementById('e-repo').value,
+format:format
+});
+document.getElementById('e-out').innerHTML='<pre>'+JSON.stringify(d,null,2)+'</pre>';
+}
+
+async function backup(){
+var d=await post('/api/backup',{});
+document.getElementById('e-out').innerHTML='<pre>'+JSON.stringify(d,null,2)+'</pre>';
+}
+</script>
+</body></html>"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HTTP HANDLER
+# ══════════════════════════════════════════════════════════════════════════════
+class Handler(http.server.BaseHTTPRequestHandler):
+
+def log_message(self, *a):
+pass
+
+def _send(self, code, body, ctype="text/html; charset=utf-8"):
+if isinstance(body, str):
+body = body.encode("utf-8")
+self.send_response(code)
+self.send_header("Content-Type", ctype)
+self.send_header("Content-Length", str(len(body)))
+self.send_header("Access-Control-Allow-Origin", "*")
+self.end_headers()
+try:
+self.wfile.write(body)
+except Exception:
+pass
+
+def _read_json(self):
+try:
+n = int(self.headers.get("Content-Length", 0))
+if n == 0:
+return {}
+return json.loads(self.rfile.read(n).decode("utf-8"))
+except Exception:
+return {}
+
+def do_GET(self):
+p = urllib.parse.urlparse(self.path)
+path = p.path
+qs = urllib.parse.parse_qs(p.query)
+
+if path in ("/", "/index.html"):
+self._send(200, PAGE)
+
+elif path.startswith("/api/discussion/"):
+did = path.split("/")[-1]
+tree = THREADS.get_tree(did)
+if tree:
+self._send(200, json.dumps(tree, ensure_ascii=False, default=str), "application/json; charset=utf-8")
+else:
+self._send(404, json.dumps({"error": "not_found"}), "application/json")
+
+elif path == "/api/discussions":
+repo = qs.get("repo", [""])[0]
+discussions = THREADS.list_by_repo(repo, sort="score", limit=100)
+self._send(200, json.dumps({"discussions": discussions, "count": len(discussions)},
+ensure_ascii=False, default=str), "application/json; charset=utf-8")
+
+elif path.startswith("/api/summarize/"):
+did = path.split("/")[-1]
+s = SUMMARIZER.summarize(did)
+if s:
+self._send(200, json.dumps(s, ensure_ascii=False, default=str), "application/json; charset=utf-8")
+else:
+self._send(404, json.dumps({"error": "not_found"}), "application/json")
+
+elif path.startswith("/api/votes/"):
+parts = path.split("/")
+if len(parts) >= 5:
+target_type = parts[3]
+target_id = parts[4]
+self._send(200, json.dumps(VOTES.info(target_type, target_id),
+ensure_ascii=False), "application/json")
+else:
+self._send(400, json.dumps({"error": "invalid"}), "application/json")
+
+elif path == "/api/stats":
+conn = db()
+stats = {
+"users": conn.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+"discussions": conn.execute("SELECT COUNT(*) FROM discussions").fetchone()[0],
+"comments": conn.execute("SELECT COUNT(*) FROM comments").fetchone()[0],
+"votes": conn.execute("SELECT COUNT(*) FROM votes").fetchone()[0],
+"reactions": conn.execute("SELECT COUNT(*) FROM reactions").fetchone()[0],
+"tags": conn.execute("SELECT COUNT(*) FROM tags").fetchone()[0],
+"subscriptions": conn.execute("SELECT COUNT(*) FROM subscriptions").fetchone()[0],
+"notifications": conn.execute("SELECT COUNT(*) FROM notifications").fetchone()[0],
+}
+conn.close()
+self._send(200, json.dumps(stats), "application/json")
+
+elif path == "/api/users/top":
+users = USERS.top(20)
+self._send(200, json.dumps({"users": users}, ensure_ascii=False, default=str),
+"application/json; charset=utf-8")
+
+elif path == "/api/health":
+self._send(200, json.dumps({
+"status": "ok", "version": VERSION, "author": AUTHOR,
+}), "application/json")
+
+else:
+self._send(404, json.dumps({"error": "not_found"}), "application/json")
+
+def do_POST(self):
+p = urllib.parse.urlparse(self.path)
+path = p.path
+body = self._read_json()
+
+if path == "/api/discussion":
+result = THREADS.create(
+repo=body.get("repo", ""),
+title=body.get("title", ""),
+body=body.get("body", ""),
+author=body.get("author", "anon"),
+parent_id=body.get("parent_id"),
+tags=body.get("tags", []),
+)
+self._send(200, json.dumps(result, ensure_ascii=False), "application/json")
+
+elif path == "/api/comment":
+cid = THREADS.add_comment(
+discussion_id=body.get("discussion_id", ""),
+body=body.get("body", ""),
+author=body.get("author", "anon"),
+parent_id=body.get("parent_id"),
+)
+self._send(200, json.dumps({"id": cid, "ok": True}), "application/json")
+
+elif path == "/api/check-duplicate":
+dups = DUPLICATES.find_duplicates(
+repo=body.get("repo", ""),
+title=body.get("title", ""),
+body=body.get("body", ""),
+threshold=float(body.get("threshold", 0.5)),
+)
+self._send(200, json.dumps({"duplicates": dups, "count": len(dups)},
+ensure_ascii=False, default=str), "application/json")
+
+elif path == "/api/vote":
+result = VOTES.vote(
+target_type=body.get("target_type", "discussion"),
+target_id=body.get("target_id", ""),
+user_id=body.get("user_id", ""),
+direction=int(body.get("direction", 1)),
+)
+self._send(200, json.dumps(result), "application/json")
+
+elif path == "/api/unvote":
+result = VOTES.unvote(
+target_type=body.get("target_type", "discussion"),
+target_id=body.get("target_id", ""),
+user_id=body.get("user_id", ""),
+)
+self._send(200, json.dumps(result), "application/json")
+
+elif path == "/api/reaction":
+result = REACTIONS.add(
+target_type=body.get("target_type", "discussion"),
+target_id=body.get("target_id", ""),
+user_id=body.get("user_id", ""),
+emoji=body.get("emoji", ""),
+)
+self._send(200, json.dumps(result), "application/json")
+
+elif path == "/api/search":
+results = SEARCH.search(
+repo=body.get("repo", ""),
+query=body.get("query", ""),
+mode=body.get("mode", "auto"),
+limit=int(body.get("limit", 50)),
+)
+self._send(200, json.dumps({
+"query": body.get("query", ""),
+"count": len(results),
+"results": results,
+}, ensure_ascii=False, default=str), "application/json")
+
+elif path == "/api/export":
+path_out = EXPORTER.export_discussions(
+repo=body.get("repo", ""),
+format_=body.get("format", "json"),
+)
+self._send(200, json.dumps({"path": path_out, "ok": path_out is not None}),
+"application/json")
+
+elif path == "/api/backup":
+path_out = EXPORTER.backup()
+self._send(200, json.dumps({"path": path_out, "ok": True}), "application/json")
+
+else:
+self._send(404, json.dumps({"error": "not_found"}), "application/json")
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+daemon_threads = True
+allow_reuse_address = True
+
+
+def local_ip():
+try:
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect(("8.8.8.8", 80))
+ip = s.getsockname()[0]
+s.close()
+return ip
+except Exception:
+return "127.0.0.1"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEED
+# ══════════════════════════════════════════════════════════════════════════════
+def seed():
+conn = db()
+count = conn.execute("SELECT COUNT(*) FROM discussions").fetchone()[0]
+conn.close()
+if count > 0:
+return
+
+info("Seed des donnees de demo...")
+
+# Users
+alice = USERS.create("alice", "Alice Dupont", "alice@example.com")
+bob = USERS.create("bob", "Bob Martin", "bob@example.com")
+charlie = USERS.create("charlie", "Charlie Lee")
+dave = USERS.create("dave", "Dave Smith")
+
+# Discussions
+d1 = THREADS.create("Aissamohammedi88/nexus", "Bug routing avec [id]",
+"Le routeur SPA ne detecte pas les routes dynamiques /users/[id]. Regex problem ?",
+alice, tags=["bug", "routing"])["id"]
+d2 = THREADS.create("Aissamohammedi88/nexus", "Re: Bug routing",
+"Meme probleme. Il faut re.escape() les crochets avant compilation.",
+bob, parent_id=d1, tags=["bug"])["id"]
+d3 = THREADS.create("Aissamohammedi88/nexus", "Re: Re: Bug routing",
+"Solution : re.escape() + re.compile() fonctionne parfaitement.",
+alice, parent_id=d2, tags=["solution"])["id"]
+
+# Discussion similaire (test doublons)
+THREADS.create("Aissamohammedi88/nexus", "Probleme routing dynamique",
+"Les routes parametrees [id] ne marchent pas dans le routeur.",
+charlie, tags=["bug"])
+
+# Autres
+THREADS.create("Aissamohammedi88/nexus", "Support TypeScript natif",
+"Prevu d'avoir le support TypeScript dans le routeur ?",
+dave, tags=["feature"])
+THREADS.create("Aissamohammedi88/nexus", "Documentation incomplete",
+"Il manque des exemples pour les routes imbriquees et groupes.",
+bob, tags=["docs"])
+THREADS.create("Aissamohammedi88/nexus", "Performance 1000 routes",
+"Le routeur ralentit avec beaucoup de routes.",
+charlie, tags=["performance"])
+
+# Comments
+THREADS.add_comment(d1, "C'est probablement un probleme de regex.", bob)
+THREADS.add_comment(d1, "Merci ! J'essaie ca.", alice)
+c = THREADS.add_comment(d2, "Tu peux montrer ton code ?", alice)
+THREADS.add_comment(d2, "Voila : re.compile(pattern)", bob, parent_id=c)
+
+# Votes
+for u in [bob, charlie, dave]:
+VOTES.vote("discussion", d1, u)
+for u in [alice, charlie]:
+VOTES.vote("discussion", d2, u)
+
+# Reactions
+REACTIONS.add("discussion", d1, bob, "fire")
+REACTIONS.add("discussion", d1, charlie, "rocket")
+REACTIONS.add("discussion", d2, alice, "love")
+
+# Subscriptions
+SUBSCRIPTIONS.subscribe(bob, "discussion", d1)
+SUBSCRIPTIONS.subscribe(alice, "discussion", d2)
+
+ok("Seed termine")
+
+
+def run_tests():
+title("TESTS AUTOMATIQUES")
+
+passed = 0
+failed = 0
+
+def check(name, condition):
+nonlocal passed, failed
+if condition:
+ok(name)
+passed += 1
+else:
+err(name)
+failed += 1
+
+# Test 1 — Users
+u1 = USERS.create("test_user_1", "Test")
+check("User creation", u1 is not None)
+check("User get", USERS.get(u1)["username"] == "test_user_1")
+
+# Test 2 — Threads
+t1 = THREADS.create("test/repo", "Test title", "Test body content with enough words", "test_user_1")
+check("Thread creation", "id" in t1)
+t2 = THREADS.create("test/repo", "Test reply", "Reply body", "test_user_1", parent_id=t1["id"])
+check("Sub-thread", t2.get("depth") == 1)
+
+tree = THREADS.get_tree(t1["id"])
+check("Tree retrieval", tree is not None and len(tree.get("children", [])) >= 1)
+
+# Test 3 — Duplicates
+dups = DUPLICATES.find_duplicates("test/repo", "Test title", "Test body content")
+check("Duplicate detection", len(dups) >= 1)
+
+# Test 4 — Summarizer
+summary = SUMMARIZER.summarize(t1["id"])
+check("Summarizer", summary is not None and "points" in summary)
+
+# Test 5 — Votes
+v1 = VOTES.vote("discussion", t1["id"], "user_a", 1)
+check("Vote creation", v1.get("ok"))
+v2 = VOTES.vote("discussion", t1["id"], "user_a", 1)
+check("Vote uniqueness", not v2.get("ok"))
+
+# Test 6 — Reactions
+r1 = REACTIONS.add("discussion", t1["id"], "user_a", "fire")
+check("Reaction add", r1.get("ok"))
+
+# Test 7 — Search
+results = SEARCH.search("test/repo", "Test*")
+check("Wildcard search", len(results) >= 1)
+results2 = SEARCH.search("test/repo", "Test title")
+check("Fulltext search", len(results2) >= 1)
+
+# Test 8 — Subscriptions
+SUBSCRIPTIONS.subscribe("user_a", "discussion", t1["id"])
+subs = SUBSCRIPTIONS.list("user_a")
+check("Subscription", len(subs) >= 1)
+
+# Test 9 — Export
+path = EXPORTER.export_discussions("test/repo", "json")
+check("Export JSON", path is not None)
+
+# Test 10 — Backup
+path = EXPORTER.backup()
+check("Backup DB", path is not None)
+
+print()
+print(Colors.BOLD + " Resultat : " + str(passed) + " passes, " + str(failed) + " echoues" + Colors.RESET)
+
+
+def main():
+title("GITHUB WANTED TOOLS PRO v" + VERSION)
+print(" Auteur : " + AUTHOR)
+print(" Licence : " + LICENCE)
+print()
+print(" Base : " + str(BASE_DIR))
+
+init_db()
+seed()
+
+if len(sys.argv) > 1 and sys.argv[1] == "test":
+run_tests()
+return
+
+if len(sys.argv) > 1 and sys.argv[1] == "backup":
+p = EXPORTER.backup()
+ok("Backup : " + p)
+return
+
+print()
+print(" Local : http://127.0.0.1:" + str(PORT) + "/")
+print(" Reseau : http://" + local_ip() + ":" + str(PORT) + "/")
+print()
+print(" Usage CLI :")
+print(" python3 github_wanted_pro.py test # Lancer les tests")
+print(" python3 github_wanted_pro.py backup # Backup DB")
+print()
+
+try:
+with Server((HOST, PORT), Handler) as httpd:
+httpd.serve_forever()
+except KeyboardInterrupt:
+print()
+ok("Arrete.")
+except OSError as e:
+err("Port " + str(PORT) + " : " + str(e))
+
+
+if __name__ == "__main__":
+main()

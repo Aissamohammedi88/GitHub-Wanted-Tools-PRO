@@ -1,0 +1,207 @@
+#!/usr/bin/env python3# -*- coding: utf-8 -*-
+"""
+Export Templates — Jira, Trello, Notion, Linear
+Formatte les discussions pour chaque outil de gestion de projet.
+"""
+import json
+import csv
+from pathlib import Path
+from datetime import datetime, timezone
+
+BASE = Path.home() / "Documents" / "github_wanted_pro" / "exports"
+BASE.mkdir(parents=True, exist_ok=True)
+
+
+class TemplateExporter:
+
+def export(self, repo, discussions, format_):
+ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+safe_repo = repo.replace("/", "_")
+
+if format_ == "jira":
+return self._export_jira(repo, discussions, safe_repo, ts)
+elif format_ == "trello":
+return self._export_trello(repo, discussions, safe_repo, ts)
+elif format_ == "notion":
+return self._export_notion(repo, discussions, safe_repo, ts)
+elif format_ == "linear":
+return self._export_linear(repo, discussions, safe_repo, ts)
+return None
+
+# ─── JIRA ───
+def _export_jira(self, repo, discussions, safe_repo, ts):
+"""Format CSV compatible import Jira"""
+path = BASE / ("jira_" + safe_repo + "_" + ts + ".csv")
+with open(path, "w", newline="", encoding="utf-8") as f:
+writer = csv.writer(f)
+writer.writerow([
+"Summary", "Description", "Issue Type", "Priority",
+"Labels", "Reporter", "Votes", "Comments", "Created"
+])
+for d in discussions:
+priority = "High" if (d.get("score") or 0) > 10 else ("Medium" if (d.get("score") or 0) > 3 else "Low")
+writer.writerow([
+d.get("title", ""),
+d.get("body", "").replace("\n", " ")[:2000],
+"Task" if "feature" in d.get("tags", []) else "Bug",
+priority,
+",".join(d.get("tags", [])),
+d.get("author", ""),
+d.get("upvotes", 0),
+d.get("comment_count", 0),
+d.get("created_at", ""),
+])
+return str(path)
+
+# ─── TRELLO ───
+def _export_trello(self, repo, discussions, safe_repo, ts):
+"""Format JSON pour import Trello (via API ou Power-Up)"""
+path = BASE / ("trello_" + safe_repo + "_" + ts + ".json")
+lists = {
+"open": {"name": "Open", "cards": []},
+"in_progress": {"name": "In Progress", "cards": []},
+"done": {"name": "Done", "cards": []},
+}
+
+for d in discussions:
+score = d.get("score", 0) or 0
+status = "open"
+if score > 20:
+status = "in_progress"
+
+labels = [{"name": t, "color": self._color_for_tag(t)} for t in d.get("tags", [])]
+
+card = {
+"name": d.get("title", ""),
+"desc": d.get("body", ""),
+"labels": labels,
+"due": None,
+"idList": status,
+"pos": score,
+"customFieldItems": [
+{"name": "Author", "value": d.get("author", "")},
+{"name": "Votes", "value": score},
+{"name": "Comments", "value": d.get("comment_count", 0)},
+]
+}
+lists[status]["cards"].append(card)
+
+data = {
+"board": {
+"name": "GitHub: " + repo,
+"desc": "Exported from GitHub Wanted Tools PRO",
+"lists": [
+{"name": v["name"], "cards": v["cards"]}
+for v in lists.values()
+]
+},
+"exported_at": datetime.now(timezone.utc).isoformat(),
+}
+
+path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+return str(path)
+
+def _color_for_tag(self, tag):
+colors = {
+"bug": "red", "feature": "blue", "docs": "green",
+"performance": "orange", "security": "purple",
+"enhancement": "sky", "question": "yellow",
+}
+return colors.get(tag, "green")
+
+# ─── NOTION ───
+def _export_notion(self, repo, discussions, safe_repo, ts):
+"""Format JSON compatible Notion API (pages)"""
+path = BASE / ("notion_" + safe_repo + "_" + ts + ".json")
+
+pages = []
+for d in discussions:
+blocks = [
+{
+"object": "block",
+"type": "heading_2",
+"heading_2": {"rich_text": [{"type": "text", "text": {"content": "Description"}}]}
+},
+{
+"object": "block",
+"type": "paragraph",
+"paragraph": {"rich_text": [{"type": "text", "text": {"content": d.get("body", "")[:2000]}}]}
+},
+{
+"object": "block",
+"type": "callout",
+"callout": {
+"rich_text": [{"type": "text", "text": {"content":
+"Auteur: " + d.get("author", "") + " | Score: " + str(d.get("score", 0)) +
+" | Commentaires: " + str(d.get("comment_count", 0))
+}}],
+"icon": {"emoji": "💬"}
+}
+}
+]
+
+if d.get("tags"):
+blocks.append({
+"object": "block",
+"type": "paragraph",
+"paragraph": {"rich_text": [{"type": "text", "text": {
+"content": "Tags: " + ", ".join(d["tags"])
+}}]}
+})
+
+pages.append({
+"parent": {"type": "database_id", "database_id": "REPLACE_ME"},
+"properties": {
+"Name": {"title": [{"text": {"content": d.get("title", "")}}]},
+"Author": {"rich_text": [{"text": {"content": d.get("author", "")}}]},
+"Score": {"number": d.get("score", 0)},
+"Comments": {"number": d.get("comment_count", 0)},
+"Created": {"date": {"start": d.get("created_at", "")}},
+},
+"children": blocks,
+})
+
+data = {
+"database_name": "GitHub: " + repo,
+"pages": pages,
+"exported_at": datetime.now(timezone.utc).isoformat(),
+}
+
+path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+return str(path)
+
+# ─── LINEAR ───
+def _export_linear(self, repo, discussions, safe_repo, ts):
+"""Format JSON compatible Linear API"""
+path = BASE / ("linear_" + safe_repo + "_" + ts + ".json")
+
+issues = []
+for i, d in enumerate(discussions, 1):
+score = d.get("score", 0) or 0
+priority = 1 if score > 20 else (2 if score > 10 else (3 if score > 3 else 4))
+
+issues.append({
+"identifier": "GWTP-" + str(i),
+"title": d.get("title", ""),
+"description": d.get("body", ""),
+"priority": priority,
+"labels": d.get("tags", []),
+"estimate": min(8, max(1, d.get("comment_count", 1) // 2)),
+"state": "Todo",
+"assignee": d.get("author", ""),
+"createdAt": d.get("created_at", ""),
+})
+
+data = {
+"team": "GitHub Import",
+"issues": issues,
+"exported_at": datetime.now(timezone.utc).isoformat(),
+}
+
+path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+return str(path)
+
+
+if __name__ == "__main__":
+te = TemplateExporter()
+print("Templates disponibles : jira, trello, notion, linear")

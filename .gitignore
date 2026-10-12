@@ -16,3 +16,24 @@ bin-release/
 # Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
 # should NOT be excluded as they contain compiler settings and other important
 # information for Eclipse / Flash Builder.
+═══════════════════════════════════════════════════════════════
+GITHUB WANTED TOOLS PRO — .gitignore
+═══════════════════════════════════════════════════════════════
+─── Python ───────────────────────────────────────────────────
+pycache/ *.py[cod] *$py.class *.so .Python env/ venv/ .venv/ ENV/ build/ dist/ *.egg-info/ .egg .pytest_cache/ .mypy_cache/ .ruff_cache/ .tox/ .coverage .coverage. htmlcov/ .hypothesis/ *.mo *.pot
+─── Data runtime ─────────────────────────────────────────────
+github_wanted_pro/ data.db data.db-shm data.db-wal *.sqlite *.sqlite3 exports/ backups/ logs/ *.log
+─── OS ───────────────────────────────────────────────────────
+.DS_Store .DS_Store? ._* .Spotlight-V100 .Trashes ehthumbs.db Thumbs.db desktop.ini *~
+─── IDE / Editors ────────────────────────────────────────────
+.vscode/ .idea/ *.swp *.swo .project .classpath .settings/ *.sublime-workspace *.sublime-project .vim/ *.vim
+─── Secrets ──────────────────────────────────────────────────
+.env .env.local .env.*.local *.pem *.key *.crt secrets/ credentials.json
+─── Temp ─────────────────────────────────────────────────────
+tmp/ temp/ *.tmp *.bak *.old *.orig
+─── Node (si ajout front) ────────────────────────────────────
+node_modules/ npm-debug.log* yarn-debug.log* yarn-error.log* .pnpm-debug.log*
+─── Backups locaux ───────────────────────────────────────────
+.backup .backup. backup_/
+─── CSV/Exports générés ──────────────────────────────────────
+.csv !example.csv discussions_.json discussions_.md discussions_.csv

@@ -1,0 +1,37 @@
+[build-system]requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "github-analytics-engine"
+version = "3.0.0"
+description = "Moteur d'analyse GitHub complet : scores, batch multi-repos, smart filter issues"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+{name = "Aissa Mohammedi", email = "aissa@example.com"}
+]
+keywords = ["github", "analytics", "repository", "scoring", "batch", "metrics"]
+classifiers = [
+"Development Status :: 4 - Beta",
+"Intended Audience :: Developers",
+"License :: OSI Approved :: MIT License",
+"Programming Language :: Python :: 3",
+"Programming Language :: Python :: 3.9",
+"Programming Language :: Python :: 3.10",
+"Programming Language :: Python :: 3.11",
+"Programming Language :: Python :: 3.12",
+"Programming Language :: Python :: 3.13",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Aissamohammedi88/github-analytics-engine"
+Repository = "https://github.com/Aissamohammedi88/github-analytics-engine"
+Issues = "https://github.com/Aissamohammedi88/github-analytics-engine/issues"
+
+[project.scripts]
+gha = "github_analytics_engine_v3:main"
+
+[tool.setuptools]
+py-modules = ["github_analytics_engine_v3"]

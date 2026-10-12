@@ -36,4 +36,62 @@ node_modules/ npm-debug.log* yarn-debug.log* yarn-error.log* .pnpm-debug.log*
 ─── Backups locaux ───────────────────────────────────────────
 .backup .backup. backup_/
 ─── CSV/Exports générés ──────────────────────────────────────
-.csv !example.csv discussions_.json discussions_.md discussions_.csv
+.csv !example.csv discussions_.json discussions_.m# ═══════════════════════════════════════════════════════════# GITHUB ANALYTICS ENGINE — .gitignore
+# ═══════════════════════════════════════════════════════════
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+ENV/
+
+# App data
+github_analytics/
+reports/
+cache/
+batch/
+*.log
+logs/
+
+# Exports
+*.csv
+*.json
+!package.json
+
+# OS
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets
+.env
+.env.local
+secrets/
+
+# Temp
+tmp/
+temp/
+*.tmp
+*.bakd discussions_.csv

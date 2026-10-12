@@ -1,0 +1,14 @@
+{"discussion_id": "disc_xxxxx",
+"title": "Bug routing dynamique",
+"author": "alice",
+"total_sentences": 42,
+"participant_count": 5,
+"child_count": 3,
+"points": [
+"Le routeur ne détecte pas les routes dynamiques /users/[id].",
+"Il faut re.escape() les crochets avant compilation.",
+"Solution : re.escape() + re.compile() fonctionne.",
+"..."
+],
+"themes": ["routing", "regex", "dynamic", "compile", "escape"]
+}
